@@ -19,6 +19,8 @@ torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
 
 dtype = torch.float16  # T4: fp16 is faster than bf16
+pin_memory = device == "cuda"
+num_workers = 2
 
 
 def set_seed(seed: int = 2025) -> None:
@@ -67,20 +69,30 @@ class FastGPTIterable(IterableDataset):
             yield x, y
 
 
-def build_loader(data: np.ndarray) -> DataLoader:
+def build_train_loader(data: np.ndarray) -> DataLoader:
     return DataLoader(
         FastGPTIterable(data, block_size),
         batch_size=batch_size,
-        num_workers=2,
-        pin_memory=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
         persistent_workers=True,
         prefetch_factor=4,
         drop_last=True,
     )
 
 
-train_loader = build_loader(train_ids)
-val_loader = build_loader(val_ids)
+def build_val_loader(data: np.ndarray) -> DataLoader:
+    return DataLoader(
+        FastGPTIterable(data, block_size),
+        batch_size=batch_size,
+        num_workers=0,
+        pin_memory=pin_memory,
+        drop_last=False,
+    )
+
+
+train_loader = build_train_loader(train_ids)
+val_loader = build_val_loader(val_ids)
 
 # ======================================================
 # 2. Model definition
@@ -207,7 +219,8 @@ config = GPTConfig(
 )
 
 model = GPT(config).to(device)
-if hasattr(torch, "compile"):
+ENABLE_COMPILE = False
+if ENABLE_COMPILE and hasattr(torch, "compile"):
     model = torch.compile(model)
 
 # ======================================================
@@ -224,6 +237,7 @@ for _, param in model.named_parameters():
     else:
         no_decay_params.append(param)
 
+use_fused = torch.cuda.is_available()
 optimizer = torch.optim.AdamW(
     [
         {"params": decay_params, "weight_decay": 0.1},
@@ -231,7 +245,7 @@ optimizer = torch.optim.AdamW(
     ],
     lr=6e-4,
     betas=(0.9, 0.999),
-    fused=True,
+    fused=use_fused,
 )
 
 scaler = torch.cuda.amp.GradScaler()
@@ -305,7 +319,7 @@ for step in range(start_step, max_steps):
             loss = loss / grad_accum
 
         scaler.scale(loss).backward()
-        total_loss += loss.item()
+        total_loss += float(loss.detach())
 
     scaler.unscale_(optimizer)
     torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
